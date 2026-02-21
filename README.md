@@ -84,20 +84,25 @@ python masked_model_gpu_mamba_next.py \
     --no-compile --no-train-eval
 ```
 
-### Gate Learning Rate Ablation
+### Ablation Flags
 
-Scale or freeze Mamba's input-dependent gating parameters (x_proj, dt_proj) to study the contribution of selective gating:
+Scale or freeze Mamba's internal parameters to study their contribution:
 
 ```bash
-# Freeze gates (approximates LTI / S4-like model)
+# Freeze input-dependent gating (x_proj, dt_proj) -- approximates LTI / S4-like model
 python masked_model_gpu_mamba_next.py \
     --gate-lr-factor 0 --d-state 32 --seq-len 1024 --stride 256 \
-    --no-compile --no-train-eval --checkpoint model_next_frozen.pt
+    --no-compile --no-train-eval --checkpoint model_next_frozen_gates.pt
 
-# Gates learn 100x slower
+# Freeze state transition matrix A_log
 python masked_model_gpu_mamba_next.py \
-    --gate-lr-factor 0.01 --d-state 32 --seq-len 1024 --stride 256 \
-    --no-compile --no-train-eval --checkpoint model_next_slow_gates.pt
+    --freeze-A --d-state 32 --seq-len 1024 --stride 256 \
+    --no-compile --no-train-eval --checkpoint model_next_freezeA.pt
+
+# Freeze both gates and A -- reservoir computing mode (see below)
+python masked_model_gpu_mamba_next.py \
+    --gate-lr-factor 0 --freeze-A --d-state 32 --seq-len 1024 --stride 256 \
+    --no-compile --no-train-eval --checkpoint model_next_freezeA_gates.pt
 ```
 
 ### Multi-Horizon Loss
@@ -144,6 +149,54 @@ python visualize_gates.py --checkpoint model_next.pt --layer 7 --sample 0
 python visualize_gates.py --checkpoint model_next.pt --umap
 ```
 
+## Reservoir Computing Ablation: Mamba as a Liquid State Machine
+
+Freezing all of Mamba's SSM-specific parameters (`--gate-lr-factor 0 --freeze-A`) turns the model into a deep reservoir computer. The SSM recurrence runs with fixed, random dynamics while only the surrounding projections learn.
+
+### What's frozen (20.6% of params)
+
+Per Mamba block, these stay at their random initialization:
+
+| Parameter | Shape | Role |
+|-----------|-------|------|
+| `x_proj` | (72, 256) | Projects input to delta, B, C -- the selectivity mechanism |
+| `dt_proj` | (256, 8) + bias | Maps delta rank to per-channel discretization step |
+| `A_log` | (256, 32) | State transition decay rates (timescales of recurrence) |
+
+With all three frozen, the SSM recurrence h[t] = exp(delta\*A) \* h[t-1] + delta\*B\*x[t] runs with fixed, random dynamics. Delta, B, and C still vary per input (computed from the random `x_proj` weights), so the reservoir is a random *nonlinear* dynamical system rather than a linear one.
+
+### What still learns (79.4% of params)
+
+| Parameter | Per-layer params | Role |
+|-----------|-----------------|------|
+| `in_proj` (512, 128) | 65,536 | Controls what enters the SSM (x branch) and what gates the output (z branch) |
+| `out_proj` (128, 256) | 32,768 | Projects gated SSM output back to model dimension |
+| `conv1d` (256, 1, 4) | 1,280 | Local temporal smoothing (4-step causal window) |
+| `D` (256,) | 256 | Skip connection past the SSM |
+| LayerNorm | 256 | Pre-norm before each block |
+| Input/output projections | 79,252 | Global: Linear(20->128) + LayerNorm + Linear(128->512->20) |
+
+### Connection to Liquid State Machines
+
+The frozen Mamba model closely parallels the [Liquid State Machine](https://doi.org/10.1162/089976602760407955) (Maass, 2002) and [Echo State Network](https://www.ai.rug.nl/minds/uploads/EchoStatesTechRep.pdf) (Jaeger, 2001) paradigms:
+
+| | Classical Reservoir | Frozen Mamba |
+|---|---|---|
+| Recurrent core | Fixed random RNN | Fixed random SSM (A, B, C, delta frozen) |
+| Input encoding | Random (fixed) | **Learned** (`in_proj`, `conv1d`) |
+| Readout | Trained linear layer | **Learned** (`out_proj`, output head) |
+| Depth | Single reservoir | **7 stacked reservoirs** with learned inter-layer routing |
+| Output gating | None | **Learned** multiplicative z-gate (SiLU) |
+| Temporal modes | Coupled (dense connectivity) | Independent (diagonal A: 256 channels x 32 states = 8,192 modes/layer) |
+
+The key upgrades over a classical reservoir are: (1) **learned input encoding** -- `in_proj` learns which linear combinations of the representation to inject into which reservoir channels, aligning inputs with the most useful temporal modes; (2) **depth** -- seven reservoirs stacked with learned projections between them, far more expressive than a single reservoir; (3) **multiplicative gating** -- the z-gate lets the model suppress or amplify specific reservoir channels per position.
+
+### Result
+
+The frozen model learns representations that are qualitatively comparable to the full Mamba model. UMAP visualisation shows clean circle separation emerging across layers, with Levina-Bickel intrinsic dimension dropping from 11.4 (input) to 4.4 (layer 7).
+
+This suggests that for this task, Mamba's selectivity (input-dependent gating) is not critical. The random SSM provides a sufficiently rich bank of temporal mixing patterns -- 7 layers x 8,192 independent temporal modes = 57,344 random temporal features -- that the learned projections can select from. The model effectively learns to *route information through* fixed random temporal filters, consistent with the [random features](https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html) framework (Rahimi & Recht, 2007).
+
 ## Files
 
 | File | Description |
@@ -158,8 +211,8 @@ python visualize_gates.py --checkpoint model_next.pt --umap
 
 ## Model Architecture
 
-- **Input projection**: Linear(feature_dim → d_model)
-- **N Mamba layers**: Pre-norm → Mamba block (selective SSM) → Dropout → Residual
-- **Output head**: LayerNorm → Linear(d_model → d_ff) → GELU → Linear(d_ff → feature_dim)
+- **Input projection**: Linear(feature_dim -> d_model)
+- **N Mamba layers**: Pre-norm -> Mamba block (selective SSM) -> Dropout -> Residual
+- **Output head**: LayerNorm -> Linear(d_model -> d_ff) -> GELU -> Linear(d_ff -> feature_dim)
 
 Default configuration: d_model=128, 7 layers, d_state=32, ~982K parameters.
