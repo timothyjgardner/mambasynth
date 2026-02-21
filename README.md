@@ -4,15 +4,65 @@ Causal next-step prediction on synthetic time series using the [Mamba](https://a
 
 A Markov-switching process generates multi-dimensional time series from overlapping oscillatory circles. A Mamba model learns to predict the next time step autoregressively, building increasingly compressed representations of the underlying state space across its layers.
 
-![UMAP of per-layer representations colored by circle state](representation_umap.png)
-
 ## Setup
 
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install torch numpy matplotlib mamba-ssm umap-learn scikit-learn
+pip install torch numpy matplotlib umap-learn scikit-learn
 ```
+
+### Building the Mamba CUDA Kernel for RTX 5090 (Blackwell / sm_120)
+
+The `mamba-ssm` package ships custom CUDA kernels (`selective_scan` and `causal_conv1d`) that must be compiled from source for Blackwell GPUs. Pre-built wheels do not exist for compute capability 12.0, and PyTorch's bundled CUDA runtime does not include `nvcc`, so a full CUDA toolkit is required.
+
+**1. Install the CUDA 12.8 toolkit** (first version with Blackwell / sm_120 support):
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-12-8
+```
+
+This installs `nvcc` to `/usr/local/cuda-12.8/bin/nvcc` (~2-3 GB download).
+
+**2. Build `causal-conv1d`** (Mamba dependency):
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.8
+export TORCH_CUDA_ARCH_LIST="12.0"
+pip install causal-conv1d
+```
+
+**3. Clone and build `mamba-ssm` from source:**
+
+```bash
+git clone https://github.com/state-spaces/mamba.git /tmp/mamba
+cd /tmp/mamba
+export CUDA_HOME=/usr/local/cuda-12.8
+export TORCH_CUDA_ARCH_LIST="12.0"
+pip install -e .
+```
+
+The CUDA kernel compilation takes 5-10 minutes. The `setup.py` in `mamba-ssm >= 2.3.0` already handles sm_120 for CUDA 12.8+, so no source patching is needed.
+
+**4. Verify:**
+
+```bash
+python -c "
+from mamba_ssm import Mamba
+import torch
+m = Mamba(d_model=128, d_state=16, d_conv=4, expand=2).cuda()
+x = torch.randn(2, 512, 128).cuda()
+y = m(x)
+print(f'OK: {tuple(x.shape)} -> {tuple(y.shape)}')
+"
+```
+
+**Why not `pip install mamba-ssm` directly?** The pip package requires `nvcc` at build time. Without a system CUDA toolkit, the build fails with `bare_metal_version` undefined in `setup.py`. The `nvidia-cuda-nvcc-cu12` pip package is misleadingly named -- it contains `ptxas` but not the actual `nvcc` compiler. A full toolkit install via apt is the only reliable path.
+
+**Why CUDA 12.8?** Earlier toolkit versions (e.g., 12.0 from `nvidia-cuda-toolkit` in Ubuntu's default repos) do not support Blackwell's sm_120 compute capability. CUDA 12.8 is the minimum version that can compile kernels for RTX 5090.
 
 ## Data Generation
 
