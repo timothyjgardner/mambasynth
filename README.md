@@ -4,6 +4,8 @@ Causal next-step prediction on synthetic time series using the [Mamba](https://a
 
 A Markov-switching process generates multi-dimensional time series from overlapping oscillatory circles. A Mamba model learns to predict the next time step autoregressively, building increasingly compressed representations of the underlying state space across its layers.
 
+![UMAP of per-layer representations colored by circle state](representation_umap.png)
+
 ## Setup
 
 ```bash
