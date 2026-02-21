@@ -4,65 +4,15 @@ Causal next-step prediction on synthetic time series using the [Mamba](https://a
 
 A Markov-switching process generates multi-dimensional time series from overlapping oscillatory circles. A Mamba model learns to predict the next time step autoregressively, building increasingly compressed representations of the underlying state space across its layers.
 
+![UMAP of per-layer representations colored by circle state](representation_umap_mamba.png)
+
 ## Setup
 
 ```bash
 python -m venv venv
 source venv/bin/activate
-pip install torch numpy matplotlib umap-learn scikit-learn
+pip install torch numpy matplotlib mamba-ssm umap-learn scikit-learn
 ```
-
-### Building the Mamba CUDA Kernel for RTX 5090 (Blackwell / sm_120)
-
-The `mamba-ssm` package ships custom CUDA kernels (`selective_scan` and `causal_conv1d`) that must be compiled from source for Blackwell GPUs. Pre-built wheels do not exist for compute capability 12.0, and PyTorch's bundled CUDA runtime does not include `nvcc`, so a full CUDA toolkit is required.
-
-**1. Install the CUDA 12.8 toolkit** (first version with Blackwell / sm_120 support):
-
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install -y cuda-toolkit-12-8
-```
-
-This installs `nvcc` to `/usr/local/cuda-12.8/bin/nvcc` (~2-3 GB download).
-
-**2. Build `causal-conv1d`** (Mamba dependency):
-
-```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST="12.0"
-pip install causal-conv1d
-```
-
-**3. Clone and build `mamba-ssm` from source:**
-
-```bash
-git clone https://github.com/state-spaces/mamba.git /tmp/mamba
-cd /tmp/mamba
-export CUDA_HOME=/usr/local/cuda-12.8
-export TORCH_CUDA_ARCH_LIST="12.0"
-pip install -e .
-```
-
-The CUDA kernel compilation takes 5-10 minutes. The `setup.py` in `mamba-ssm >= 2.3.0` already handles sm_120 for CUDA 12.8+, so no source patching is needed.
-
-**4. Verify:**
-
-```bash
-python -c "
-from mamba_ssm import Mamba
-import torch
-m = Mamba(d_model=128, d_state=16, d_conv=4, expand=2).cuda()
-x = torch.randn(2, 512, 128).cuda()
-y = m(x)
-print(f'OK: {tuple(x.shape)} -> {tuple(y.shape)}')
-"
-```
-
-**Why not `pip install mamba-ssm` directly?** The pip package requires `nvcc` at build time. Without a system CUDA toolkit, the build fails with `bare_metal_version` undefined in `setup.py`. The `nvidia-cuda-nvcc-cu12` pip package is misleadingly named -- it contains `ptxas` but not the actual `nvcc` compiler. A full toolkit install via apt is the only reliable path.
-
-**Why CUDA 12.8?** Earlier toolkit versions (e.g., 12.0 from `nvidia-cuda-toolkit` in Ubuntu's default repos) do not support Blackwell's sm_120 compute capability. CUDA 12.8 is the minimum version that can compile kernels for RTX 5090.
 
 ## Data Generation
 
@@ -84,25 +34,20 @@ python masked_model_gpu_mamba_next.py \
     --no-compile --no-train-eval
 ```
 
-### Ablation Flags
+### Gate Learning Rate Ablation
 
-Scale or freeze Mamba's internal parameters to study their contribution:
+Scale or freeze Mamba's input-dependent gating parameters (x_proj, dt_proj) to study the contribution of selective gating:
 
 ```bash
-# Freeze input-dependent gating (x_proj, dt_proj) -- approximates LTI / S4-like model
+# Freeze gates (approximates LTI / S4-like model)
 python masked_model_gpu_mamba_next.py \
     --gate-lr-factor 0 --d-state 32 --seq-len 1024 --stride 256 \
-    --no-compile --no-train-eval --checkpoint model_next_frozen_gates.pt
+    --no-compile --no-train-eval --checkpoint model_next_frozen.pt
 
-# Freeze state transition matrix A_log
+# Gates learn 100x slower
 python masked_model_gpu_mamba_next.py \
-    --freeze-A --d-state 32 --seq-len 1024 --stride 256 \
-    --no-compile --no-train-eval --checkpoint model_next_freezeA.pt
-
-# Freeze both gates and A -- reservoir computing mode (see below)
-python masked_model_gpu_mamba_next.py \
-    --gate-lr-factor 0 --freeze-A --d-state 32 --seq-len 1024 --stride 256 \
-    --no-compile --no-train-eval --checkpoint model_next_freezeA_gates.pt
+    --gate-lr-factor 0.01 --d-state 32 --seq-len 1024 --stride 256 \
+    --no-compile --no-train-eval --checkpoint model_next_slow_gates.pt
 ```
 
 ### Multi-Horizon Loss
@@ -149,54 +94,6 @@ python visualize_gates.py --checkpoint model_next.pt --layer 7 --sample 0
 python visualize_gates.py --checkpoint model_next.pt --umap
 ```
 
-## Reservoir Computing Ablation: Mamba as a Liquid State Machine
-
-Freezing all of Mamba's SSM-specific parameters (`--gate-lr-factor 0 --freeze-A`) turns the model into a deep reservoir computer. The SSM recurrence runs with fixed, random dynamics while only the surrounding projections learn.
-
-### What's frozen (20.6% of params)
-
-Per Mamba block, these stay at their random initialization:
-
-| Parameter | Shape | Role |
-|-----------|-------|------|
-| `x_proj` | (72, 256) | Projects input to delta, B, C -- the selectivity mechanism |
-| `dt_proj` | (256, 8) + bias | Maps delta rank to per-channel discretization step |
-| `A_log` | (256, 32) | State transition decay rates (timescales of recurrence) |
-
-With all three frozen, the SSM recurrence h[t] = exp(delta\*A) \* h[t-1] + delta\*B\*x[t] runs with fixed, random dynamics. Delta, B, and C still vary per input (computed from the random `x_proj` weights), so the reservoir is a random *nonlinear* dynamical system rather than a linear one.
-
-### What still learns (79.4% of params)
-
-| Parameter | Per-layer params | Role |
-|-----------|-----------------|------|
-| `in_proj` (512, 128) | 65,536 | Controls what enters the SSM (x branch) and what gates the output (z branch) |
-| `out_proj` (128, 256) | 32,768 | Projects gated SSM output back to model dimension |
-| `conv1d` (256, 1, 4) | 1,280 | Local temporal smoothing (4-step causal window) |
-| `D` (256,) | 256 | Skip connection past the SSM |
-| LayerNorm | 256 | Pre-norm before each block |
-| Input/output projections | 79,252 | Global: Linear(20->128) + LayerNorm + Linear(128->512->20) |
-
-### Connection to Liquid State Machines
-
-The frozen Mamba model closely parallels the [Liquid State Machine](https://doi.org/10.1162/089976602760407955) (Maass, 2002) and [Echo State Network](https://www.ai.rug.nl/minds/uploads/EchoStatesTechRep.pdf) (Jaeger, 2001) paradigms:
-
-| | Classical Reservoir | Frozen Mamba |
-|---|---|---|
-| Recurrent core | Fixed random RNN | Fixed random SSM (A, B, C, delta frozen) |
-| Input encoding | Random (fixed) | **Learned** (`in_proj`, `conv1d`) |
-| Readout | Trained linear layer | **Learned** (`out_proj`, output head) |
-| Depth | Single reservoir | **7 stacked reservoirs** with learned inter-layer routing |
-| Output gating | None | **Learned** multiplicative z-gate (SiLU) |
-| Temporal modes | Coupled (dense connectivity) | Independent (diagonal A: 256 channels x 32 states = 8,192 modes/layer) |
-
-The key upgrades over a classical reservoir are: (1) **learned input encoding** -- `in_proj` learns which linear combinations of the representation to inject into which reservoir channels, aligning inputs with the most useful temporal modes; (2) **depth** -- seven reservoirs stacked with learned projections between them, far more expressive than a single reservoir; (3) **multiplicative gating** -- the z-gate lets the model suppress or amplify specific reservoir channels per position.
-
-### Result
-
-The frozen model learns representations that are qualitatively comparable to the full Mamba model. UMAP visualisation shows clean circle separation emerging across layers, with Levina-Bickel intrinsic dimension dropping from 11.4 (input) to 4.4 (layer 7).
-
-This suggests that for this task, Mamba's selectivity (input-dependent gating) is not critical. The random SSM provides a sufficiently rich bank of temporal mixing patterns -- 7 layers x 8,192 independent temporal modes = 57,344 random temporal features -- that the learned projections can select from. The model effectively learns to *route information through* fixed random temporal filters, consistent with the [random features](https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html) framework (Rahimi & Recht, 2007).
-
 ## Files
 
 | File | Description |
@@ -211,8 +108,8 @@ This suggests that for this task, Mamba's selectivity (input-dependent gating) i
 
 ## Model Architecture
 
-- **Input projection**: Linear(feature_dim -> d_model)
-- **N Mamba layers**: Pre-norm -> Mamba block (selective SSM) -> Dropout -> Residual
-- **Output head**: LayerNorm -> Linear(d_model -> d_ff) -> GELU -> Linear(d_ff -> feature_dim)
+- **Input projection**: Linear(feature_dim → d_model)
+- **N Mamba layers**: Pre-norm → Mamba block (selective SSM) → Dropout → Residual
+- **Output head**: LayerNorm → Linear(d_model → d_ff) → GELU → Linear(d_ff → feature_dim)
 
 Default configuration: d_model=128, 7 layers, d_state=32, ~982K parameters.

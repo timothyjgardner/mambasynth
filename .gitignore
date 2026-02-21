@@ -6,11 +6,11 @@ venv/
 *.pt
 *.npz
 data/
-# Ignore most PNGs but track key results
 *.png
-!next_prediction_*.png
+!representation_umap_mamba.png
 !representation_umap.png
 !representation_umap_hidden.png
+!next_prediction_*.png
 *.csv
 *.egg-info/
 dist/
