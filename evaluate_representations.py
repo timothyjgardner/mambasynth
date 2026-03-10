@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import torch
 import umap
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
 
 from masked_model_gpu_mamba_next import CausalTimeSeriesMamba
 from estimate_dimension import levina_bickel_estimator
@@ -202,6 +203,11 @@ def main():
                         help='Apply PCA to reduce to N dimensions before '
                              'UMAP (0 = no PCA, run UMAP on raw data). '
                              'E.g. --pca 10 reduces 128D → 10D first.')
+    parser.add_argument('--velocity', action='store_true',
+                        help='Concatenate finite-difference velocity with '
+                             'position before UMAP, doubling the '
+                             'dimensionality.  Saves to '
+                             'representation_umap_velocity.png.')
     args = parser.parse_args()
 
     device = torch.device(
@@ -282,29 +288,62 @@ def main():
 
     states_sub = states_used[idx]
 
+    # ---- Velocity helper ----
+    def _with_velocity(rep, n_used, seq_len):
+        """Concatenate finite-difference velocity with position.
+
+        Zeros out velocity at window boundaries where the difference
+        would span two non-contiguous windows.
+        """
+        vel = np.zeros_like(rep)
+        vel[:-1] = rep[1:] - rep[:-1]
+        # Zero out boundary frames (last step of each window)
+        for w in range(n_used // seq_len):
+            vel[w * seq_len + seq_len - 1] = 0.0
+        return np.concatenate([rep, vel], axis=1)
+
     # ---- Build panel data for selected layers ----
     def get_panel_data(key):
         """Return (title, data_subsampled, key) for a given panel key."""
         if key == 'input':
-            return (f'Input ({X.shape[1]}D)', X[idx].astype(np.float32), key)
+            data = X[:n_used].astype(np.float32)
+            D = data.shape[1]
         elif key == 'output':
-            return (f'Output ({layer_reps[-1].shape[1]}D)',
-                    layer_reps[-1][idx], key)
+            data = layer_reps[-1]
+            D = data.shape[1]
         else:
-            # layer_N → index N-1
             layer_i = int(key.split('_')[1]) - 1
-            return (f'Layer {layer_i+1} ({layer_reps[layer_i].shape[1]}D)',
-                    layer_reps[layer_i][idx], key)
+            data = layer_reps[layer_i]
+            D = data.shape[1]
+
+        if args.velocity:
+            data = _with_velocity(data, n_used, seq_len)
+            label = f'{D}+{D}D'
+        else:
+            label = f'{D}D'
+
+        if key == 'input':
+            title = f'Input ({label})'
+        elif key == 'output':
+            title = f'Output ({label})'
+        else:
+            layer_i = int(key.split('_')[1]) - 1
+            title = f'Layer {layer_i+1} ({label})'
+
+        return (title, data[idx], key)
 
     def get_lb_data(key):
         """Return data for Levina-Bickel for a given panel key."""
         if key == 'input':
-            return X[lb_idx].astype(np.float32)
+            data = X[:n_used].astype(np.float32)
         elif key == 'output':
-            return layer_reps[-1][lb_idx]
+            data = layer_reps[-1]
         else:
             layer_i = int(key.split('_')[1]) - 1
-            return layer_reps[layer_i][lb_idx]
+            data = layer_reps[layer_i]
+        if args.velocity:
+            data = _with_velocity(data, n_used, seq_len)
+        return data[lb_idx]
 
     # ---- Levina-Bickel on selected layers (optional) ----
     lb_results = {}
@@ -339,6 +378,8 @@ def main():
     # ---- UMAP for selected layers ----
     panels = [get_panel_data(key) for key in selected_keys]
 
+    sil_results = {}
+
     def _make_single_umap(title, data, lb_key, save_path):
         """Compute UMAP and save a single-layer figure."""
         data, title = _maybe_pca(data, title)
@@ -347,16 +388,22 @@ def main():
                             metric='euclidean', n_jobs=-1)
         embedding = reducer.fit_transform(data)
 
+        sil = silhouette_score(embedding, states_sub)
+        sil_results[lb_key] = sil
+
         fig, ax = plt.subplots(figsize=(10, 8))
         sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
                         cmap='tab10', s=4, alpha=0.5)
         ax.set_xlabel('UMAP 1', fontsize=12)
         ax.set_ylabel('UMAP 2', fontsize=12)
 
+        subtitle_parts = []
         if lb_key in lb_results:
             lb30 = lb_results[lb_key].get(30, None)
             if lb30 is not None:
-                title += f'  (LB k=30: {lb30:.1f})'
+                subtitle_parts.append(f'LB k=30: {lb30:.1f}')
+        subtitle_parts.append(f'Sil: {sil:.3f}')
+        title += f'  ({", ".join(subtitle_parts)})'
         ax.set_title(title, fontsize=14)
         ax.grid(True, alpha=0.2)
         cbar = plt.colorbar(sc, ax=ax, label='Circle index')
@@ -390,16 +437,22 @@ def main():
                                 metric='euclidean', n_jobs=-1)
             embedding = reducer.fit_transform(data)
 
+            sil = silhouette_score(embedding, states_sub)
+            sil_results[lb_key] = sil
+
             ax = axes[ax_i]
             sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
                             cmap='tab10', s=3, alpha=0.5)
             ax.set_xlabel('UMAP 1')
             ax.set_ylabel('UMAP 2')
 
+            subtitle_parts = []
             if lb_key in lb_results:
                 lb30 = lb_results[lb_key].get(30, None)
                 if lb30 is not None:
-                    title += f'  (LB k=30: {lb30:.1f})'
+                    subtitle_parts.append(f'LB k=30: {lb30:.1f}')
+            subtitle_parts.append(f'Sil: {sil:.3f}')
+            title += f'  ({", ".join(subtitle_parts)})'
             ax.set_title(title, fontsize=12)
             ax.grid(True, alpha=0.2)
 
@@ -414,59 +467,25 @@ def main():
                      fontweight='bold', y=1.02)
         plt.tight_layout()
 
-        fname = 'representation_umap.png'
+        fname = ('representation_umap_velocity.png' if args.velocity
+                 else 'representation_umap.png')
         plt.savefig(fname, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"\nSaved {fname}")
 
-    # ---- Hidden-state UMAP (Mamba SSM outputs before residual) ----
-    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-    if hasattr(raw_model, 'layers'):
-        print("\n--- Extracting Mamba hidden states (before residual) ---")
-        hidden_reps, _ = extract_hidden_states(
-            model, X, device, batch_size=64, seq_len=seq_len,
-        )
-        n_hidden = len(hidden_reps)
-        n_cols_h = min(n_hidden, 4)
-        n_rows_h = (n_hidden + n_cols_h - 1) // n_cols_h
+    # ---- Print silhouette summary ----
+    if sil_results:
+        print(f"\nSilhouette scores (UMAP 2D):")
+        for key in selected_keys:
+            if key in sil_results:
+                label = key.replace('_', ' ').title()
+                print(f"  {label}: {sil_results[key]:.3f}")
 
-        fig, axes = plt.subplots(n_rows_h, n_cols_h,
-                                 figsize=(7 * n_cols_h, 6 * n_rows_h))
-        if n_hidden == 1:
-            axes = np.array([axes])
-        axes = np.atleast_1d(axes).flatten()
-
-        for i in range(n_hidden):
-            data_h = hidden_reps[i][idx]
-            title_h = f'Hidden {i+1} ({data_h.shape[1]}D)'
-            data_h, title_h = _maybe_pca(data_h, title_h)
-            print(f"Computing UMAP for {title_h}...")
-            reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
-                                metric='euclidean', n_jobs=-1)
-            emb = reducer.fit_transform(data_h)
-
-            ax = axes[i]
-            sc = ax.scatter(emb[:, 0], emb[:, 1], c=states_sub,
-                            cmap='tab10', s=3, alpha=0.5)
-            ax.set_xlabel('UMAP 1')
-            ax.set_ylabel('UMAP 2')
-            ax.set_title(title_h, fontsize=12)
-            ax.grid(True, alpha=0.2)
-
-        cbar = plt.colorbar(sc, ax=axes[n_hidden - 1], label='Circle index')
-        cbar.set_ticks(range(config['n_circles']))
-
-        for ax_i in range(n_hidden, len(axes)):
-            axes[ax_i].axis('off')
-
-        fig.suptitle('UMAP of Mamba Hidden States (before residual)',
-                     fontsize=15, fontweight='bold', y=1.02)
-        plt.tight_layout()
-
-        fname_h = 'representation_umap_hidden.png'
-        plt.savefig(fname_h, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"\nSaved {fname_h}")
+    # Hidden-state UMAP disabled — was computing UMAP of Mamba SSM outputs
+    # before residual add. Re-enable by uncommenting the block below.
+    # raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    # if hasattr(raw_model, 'layers'):
+    #     ... (see git history)
 
 
 if __name__ == '__main__':

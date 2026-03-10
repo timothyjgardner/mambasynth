@@ -34,6 +34,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from mamba_ssm import Mamba
@@ -175,25 +176,73 @@ class CausalTimeSeriesMamba(nn.Module):
                 migrated[k] = v
         return migrated
 
-    def forward(self, x):
+    def forward(self, x, return_layers=False):
         """
         Parameters
         ----------
         x : (batch, seq_len, feature_dim)
+        return_layers : bool
+            If True, also return per-layer representations for auxiliary
+            losses (e.g. slowness).
 
         Returns
         -------
         preds : dict {horizon_k: (batch, seq_len, feature_dim)}
             preds[k][:, t, :] is the model's prediction of x[:, t+k, :].
             When max_horizon=1, returns a single-entry dict.
+        layer_hiddens : list of (batch, seq_len, d_model), only if
+            return_layers=True.
         """
         h = self.input_dropout(self.input_proj(x))
 
+        layer_hiddens = [] if return_layers else None
         for layer in self.layers:
             h = layer(h)
+            if return_layers:
+                layer_hiddens.append(h)
 
         h = self.final_norm(h)
-        return {k: head(h) for k, head in self.output_heads.items()}
+        preds = {k: head(h) for k, head in self.output_heads.items()}
+        if return_layers:
+            return preds, layer_hiddens
+        return preds
+
+    @staticmethod
+    def slowness_loss(layer_hiddens):
+        """Temporal coherence penalty: mean squared velocity of
+        representations across all layers.
+
+        L_slow = (1/L) Σ_layers  mean_t ||h_t - h_{t-1}||²
+        """
+        total = 0.0
+        for h in layer_hiddens:
+            diff = h[:, 1:] - h[:, :-1]
+            total = total + diff.pow(2).mean()
+        return total / len(layer_hiddens)
+
+    @staticmethod
+    def contrastive_loss(layer_hiddens, temperature=0.07, n_negatives=256):
+        """Temporal InfoNCE: consecutive timesteps are positive pairs,
+        random timesteps from the minibatch are negatives."""
+        total = 0.0
+        for h in layer_hiddens:
+            B, T, D = h.shape
+            h_norm = F.normalize(h, dim=-1)
+
+            anchors = h_norm[:, :-1]                          # (B, T-1, D)
+            positives = h_norm[:, 1:]                         # (B, T-1, D)
+            pos_sim = (anchors * positives).sum(-1, keepdim=True) / temperature
+
+            flat = h_norm.reshape(-1, D)
+            idx = torch.randint(0, B * T, (n_negatives,), device=h.device)
+            negs = flat[idx]                                  # (K, D)
+            neg_sim = torch.einsum('btd,kd->btk', anchors, negs) / temperature
+
+            logits = torch.cat([pos_sim, neg_sim], dim=-1)    # (B, T-1, 1+K)
+            labels = torch.zeros(B * (T - 1), dtype=torch.long, device=h.device)
+            total += F.cross_entropy(logits.reshape(-1, 1 + n_negatives), labels)
+
+        return total / len(layer_hiddens)
 
     @torch.no_grad()
     def encode(self, x):
@@ -242,17 +291,61 @@ def multi_horizon_mse_loss(preds, target):
 # Training / evaluation loops
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype):
+def _random_rotation(D, device, eps=0.0):
+    """Generate a random orthogonal matrix.
+
+    eps=0 → uniformly random rotation (Haar measure).
+    eps>0 → small-angle rotation: Q = expm(eps * A) where A is
+    antisymmetric, giving a rotation of magnitude ~eps near identity.
+    """
+    if eps > 0:
+        M = torch.randn(D, D, device=device)
+        A = (M - M.T) / 2
+        return torch.matrix_exp(eps * A)
+    Q, _ = torch.linalg.qr(torch.randn(D, D, device=device))
+    return Q
+
+
+def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
+                    aug_noise=0.0, aug_rotate=False, aug_rotate_eps=0.0,
+                    aug_scale=0.0, slowness_lambda=0.0,
+                    contrastive_lambda=0.0, contrastive_temp=0.07,
+                    contrastive_negatives=256):
     model.train()
     total_loss = 0.0
     n_batches = 0
+    need_layers = slowness_lambda > 0 or contrastive_lambda > 0
 
     for x, state, _mask in loader:
         x = x.to(device, non_blocking=True)
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            preds = model(x)
+            x_input = x
+            if aug_rotate:
+                D = x.shape[-1]
+                Q = _random_rotation(D, device, eps=aug_rotate_eps)
+                x_input = x_input @ Q.T
+                x = x @ Q.T
+            if aug_scale > 0:
+                s = 1.0 - aug_scale + 2 * aug_scale * torch.rand(
+                    x.size(0), 1, 1, device=device)
+                x_input = x_input * s
+                x = x * s
+            if aug_noise > 0:
+                x_input = x_input + torch.randn_like(x_input) * aug_noise
+            if need_layers:
+                preds, layer_hiddens = model(x_input, return_layers=True)
+            else:
+                preds = model(x_input)
             loss = multi_horizon_mse_loss(preds, x)
+            if need_layers:
+                raw_m = model._orig_mod if hasattr(model, '_orig_mod') else model
+                if slowness_lambda > 0:
+                    loss = loss + slowness_lambda * raw_m.slowness_loss(layer_hiddens)
+                if contrastive_lambda > 0:
+                    loss = loss + contrastive_lambda * raw_m.contrastive_loss(
+                        layer_hiddens, temperature=contrastive_temp,
+                        n_negatives=contrastive_negatives)
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -467,6 +560,38 @@ def main():
                         help='LR multiplier for Mamba gating params '
                              '(x_proj, dt_proj).  0 = freeze gates '
                              '(LTI-like), 1 = normal Mamba.')
+    # Augmentation
+    parser.add_argument('--slowness-lambda', type=float, default=0.0,
+                        help='Temporal coherence penalty λ on intermediate '
+                             'representations (0 = disabled).  Penalises '
+                             '||h_t - h_{t-1}||² across all layers.')
+    parser.add_argument('--contrastive-lambda', type=float, default=0.0,
+                        help='Temporal InfoNCE contrastive loss λ '
+                             '(0 = disabled).  Pulls consecutive timesteps '
+                             'together, pushes random timesteps apart.')
+    parser.add_argument('--contrastive-temp', type=float, default=0.07,
+                        help='Temperature for contrastive loss similarity.')
+    parser.add_argument('--contrastive-negatives', type=int, default=256,
+                        help='Number of sampled negatives per anchor.')
+    parser.add_argument('--aug-noise', type=float, default=0.0,
+                        help='Gaussian noise std added to inputs during '
+                             'training (0 = disabled).  Target is still '
+                             'the clean signal.')
+    parser.add_argument('--aug-rotate', action='store_true',
+                        help='Apply a random orthogonal rotation to each '
+                             'batch during training.  Both input and target '
+                             'are rotated so dynamics are preserved but the '
+                             'subspace embedding changes every batch.')
+    parser.add_argument('--aug-rotate-eps', type=float, default=0.0,
+                        help='Small-angle rotation strength (requires '
+                             '--aug-rotate).  0 = uniformly random rotation. '
+                             '>0 = rotation angle ~ eps near identity '
+                             '(e.g. 0.1–0.3 for gentle perturbation).')
+    parser.add_argument('--aug-scale', type=float, default=0.0,
+                        help='Amplitude scaling half-width α.  Each window '
+                             'is scaled by a uniform random factor in '
+                             '[1-α, 1+α].  0 = disabled.  E.g. 0.2 gives '
+                             'scales in [0.8, 1.2].')
     # Training
     parser.add_argument('--batch-size', type=int, default=128,
                         help='Training batch size')
@@ -576,6 +701,23 @@ def main():
           f"d_conv={args.d_conv}")
     if args.max_horizon > 1:
         print(f"  multi-horizon loss: {model.horizons}")
+    aug_parts = []
+    if args.aug_noise > 0:
+        aug_parts.append(f"noise σ={args.aug_noise}")
+    if args.aug_rotate:
+        if args.aug_rotate_eps > 0:
+            aug_parts.append(f"small-angle rotation (ε={args.aug_rotate_eps})")
+        else:
+            aug_parts.append("random rotation")
+    if args.aug_scale > 0:
+        aug_parts.append(f"scale α={args.aug_scale}")
+    if aug_parts:
+        print(f"  augmentation: {', '.join(aug_parts)}")
+    if args.slowness_lambda > 0:
+        print(f"  slowness loss λ={args.slowness_lambda}")
+    if args.contrastive_lambda > 0:
+        print(f"  contrastive loss λ={args.contrastive_lambda} "
+              f"(τ={args.contrastive_temp}, K={args.contrastive_negatives})")
 
     # ---- torch.compile ----
     if not args.no_compile and device.type == 'cuda':
@@ -669,7 +811,15 @@ def main():
         t0 = time.perf_counter()
 
         train_loss = train_one_epoch(model, train_loader, optimizer,
-                                     scaler, device, amp_dtype)
+                                     scaler, device, amp_dtype,
+                                     aug_noise=args.aug_noise,
+                                     aug_rotate=args.aug_rotate,
+                                     aug_rotate_eps=args.aug_rotate_eps,
+                                     aug_scale=args.aug_scale,
+                                     slowness_lambda=args.slowness_lambda,
+                                     contrastive_lambda=args.contrastive_lambda,
+                                     contrastive_temp=args.contrastive_temp,
+                                     contrastive_negatives=args.contrastive_negatives)
         train_eval_loss = (evaluate(model, train_loader, device, amp_dtype)
                            if do_train_eval else float('nan'))
         val_loss = evaluate(model, val_loader, device, amp_dtype)
