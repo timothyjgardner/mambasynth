@@ -18,6 +18,7 @@ Usage
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -25,33 +26,133 @@ import matplotlib.pyplot as plt
 import torch
 import umap
 from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
 
 from masked_model_gpu_mamba_next import CausalTimeSeriesMamba
+from mamba_jepa import CausalMambaJEPA
 from estimate_dimension import levina_bickel_estimator
 
 
+def gpu_silhouette_score(X_np, labels, batch_size=2048):
+    """GPU-accelerated silhouette score using batched pairwise distances."""
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = torch.from_numpy(np.ascontiguousarray(X_np)).float().to(device)
+    labels_t = torch.from_numpy(np.asarray(labels)).long().to(device)
+    n = X.shape[0]
+    unique_labels = torch.unique(labels_t)
+    n_clusters = unique_labels.shape[0]
+
+    if n_clusters < 2:
+        return 0.0
+
+    cluster_masks = labels_t.unsqueeze(0) == unique_labels.unsqueeze(1)
+    cluster_sizes = cluster_masks.sum(dim=1).float()
+
+    a_vals = torch.zeros(n, device=device)
+    b_vals = torch.full((n,), float('inf'), device=device)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = torch.cdist(X[start:end], X)
+        batch_labels = labels_t[start:end]
+
+        for ci, cl in enumerate(unique_labels):
+            mask_c = cluster_masks[ci]
+            sum_dists = (dists * mask_c.unsqueeze(0).float()).sum(dim=1)
+            count = cluster_sizes[ci]
+
+            is_own = (batch_labels == cl)
+
+            own_mean = sum_dists / (count - 1).clamp(min=1)
+            a_vals[start:end] = torch.where(is_own, own_mean, a_vals[start:end])
+
+            other_mean = sum_dists / count.clamp(min=1)
+            cur_b = b_vals[start:end]
+            b_vals[start:end] = torch.where(
+                ~is_own & (other_mean < cur_b), other_mean, cur_b)
+
+    s = (b_vals - a_vals) / torch.max(a_vals, b_vals).clamp(min=1e-10)
+    return s.mean().item()
+
+
+def gpu_knn(X_np, k, batch_size=2048):
+    """Batched k-NN on GPU using PyTorch.
+
+    Returns (distances, indices) each of shape (n, k).
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    X = torch.from_numpy(np.ascontiguousarray(X_np)).float().to(device)
+    n = X.shape[0]
+    all_dists = torch.zeros(n, k, device=device)
+    all_idx = torch.zeros(n, k, dtype=torch.long, device=device)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        dists = torch.cdist(X[start:end], X)
+        dists[:, start:end].fill_diagonal_(float('inf'))
+        topk_d, topk_i = dists.topk(k, dim=1, largest=False)
+        all_dists[start:end] = topk_d
+        all_idx[start:end] = topk_i
+
+    return all_dists.cpu().numpy(), all_idx.cpu().numpy()
+
+
+def _fit_umap(panel_args):
+    """Runs UMAP fit_transform for one panel, using precomputed k-NN if available."""
+    title, data, lb_key, n_neighbors, pre = panel_args
+    if pre is not None:
+        knn_indices, knn_dists = pre
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors, min_dist=0.3,
+            precomputed_knn=(knn_indices, knn_dists, None))
+    else:
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors, min_dist=0.3,
+            metric='euclidean', n_jobs=-1)
+    return reducer.fit_transform(data)
+
+
 def load_model(checkpoint_path, device):
-    """Load a trained CausalTimeSeriesMamba from checkpoint."""
+    """Load a trained model from checkpoint (supports both CausalTimeSeriesMamba
+    and CausalMambaJEPA)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     args = ckpt['args']
+    model_type = args.get('model_type', 'mamba_next')
 
-    model = CausalTimeSeriesMamba(
-        feature_dim=args.get('feature_dim', 20),
-        d_model=args['d_model'],
-        n_layers=args['n_layers'],
-        d_state=args['d_state'],
-        d_conv=args.get('d_conv', 4),
-        expand=args.get('expand', 2),
-        d_ff=args.get('d_ff', 512),
-        dropout=0.0,
-        max_horizon=args.get('max_horizon', 1),
-    ).to(device)
-    sd = CausalTimeSeriesMamba.migrate_state_dict(ckpt['model_state_dict'])
-    model.load_state_dict(sd)
-    model.eval()
-    print(f"Loaded Causal Mamba checkpoint from epoch {ckpt['epoch']}  "
-          f"(val MSE {ckpt.get('val_loss', '?'):.4f})")
+    if model_type == 'mamba_jepa':
+        model = CausalMambaJEPA(
+            feature_dim=args.get('feature_dim', 20),
+            d_model=args['d_model'],
+            n_layers=args['n_layers'],
+            d_state=args['d_state'],
+            d_conv=args.get('d_conv', 4),
+            expand=args.get('expand', 2),
+            dropout=0.0,
+            predictor_n_layers=args.get('predictor_n_layers', 2),
+            predictor_type='mlp' if args.get('predictor_mlp', False) else 'mamba',
+        ).to(device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        val_metric = ckpt.get('val_loss', '?')
+        print(f"Loaded Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
+              f"(val JEPA loss {val_metric:.4f})")
+    else:
+        model = CausalTimeSeriesMamba(
+            feature_dim=args.get('feature_dim', 20),
+            d_model=args['d_model'],
+            n_layers=args['n_layers'],
+            d_state=args['d_state'],
+            d_conv=args.get('d_conv', 4),
+            expand=args.get('expand', 2),
+            d_ff=args.get('d_ff', 512),
+            dropout=0.0,
+            max_horizon=args.get('max_horizon', 1),
+        ).to(device)
+        sd = CausalTimeSeriesMamba.migrate_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(sd)
+        model.eval()
+        print(f"Loaded Causal Mamba checkpoint from epoch {ckpt['epoch']}  "
+              f"(val MSE {ckpt.get('val_loss', '?'):.4f})")
+
     return model, args
 
 
@@ -120,16 +221,20 @@ def extract_hidden_states(model, X, device, batch_size=64, seq_len=512):
     """
     raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-    if not hasattr(raw_model, 'layers'):
-        raise ValueError("Model does not have .layers — hidden state "
-                         "extraction requires CausalTimeSeriesMamba")
+    if hasattr(raw_model, 'layers'):
+        mamba_layers = raw_model.layers
+    elif hasattr(raw_model, 'target_encoder'):
+        mamba_layers = raw_model.target_encoder.layers
+    else:
+        raise ValueError("Model does not have .layers or .target_encoder — "
+                         "hidden state extraction not supported")
 
     n_steps = X.shape[0]
     n_windows = n_steps // seq_len
     n_used = n_windows * seq_len
     X_trim = X[:n_used]
 
-    n_layers = len(raw_model.layers)
+    n_layers = len(mamba_layers)
     all_hidden = [[] for _ in range(n_layers)]
 
     # Storage for hook captures (reset each batch)
@@ -142,7 +247,7 @@ def extract_hidden_states(model, X, device, batch_size=64, seq_len=512):
 
     # Register hooks on the mamba sub-module inside each MambaLayer
     hooks = []
-    for i, layer in enumerate(raw_model.layers):
+    for i, layer in enumerate(mamba_layers):
         h = layer.mamba.register_forward_hook(make_hook(i))
         hooks.append(h)
 
@@ -235,21 +340,26 @@ def main():
         model, X, device, batch_size=64, seq_len=seq_len,
     )
     states_used = states[:n_used]
-    # Last entry is the output projection (feature_dim D), rest are encoder
-    # layers (d_model D)
-    n_encoder_layers = len(layer_reps) - 1
-    n_all = len(layer_reps)
 
-    print(f"Extracted {n_encoder_layers} encoder layers + output projection")
-    print(f"  Encoder layers: {layer_reps[0].shape}")
-    print(f"  Output projection: {layer_reps[-1].shape}")
+    model_type = model_args.get('model_type', 'mamba_next')
+    has_output_proj = model_type != 'mamba_jepa'
 
-    # ---- Parse --layers filter ----
-    # Build the full list of available panels: input, layer_1..N, output
+    if has_output_proj:
+        n_encoder_layers = len(layer_reps) - 1
+        print(f"Extracted {n_encoder_layers} encoder layers + output projection")
+        print(f"  Encoder layers: {layer_reps[0].shape}")
+        print(f"  Output projection: {layer_reps[-1].shape}")
+    else:
+        n_encoder_layers = len(layer_reps)
+        print(f"Extracted {n_encoder_layers} encoder layers")
+        print(f"  Encoder layers: {layer_reps[0].shape}")
+
+    # Build the full list of available panels: input, layer_1..N, [output]
     all_panel_keys = ['input']
     for i in range(n_encoder_layers):
         all_panel_keys.append(f'layer_{i+1}')
-    all_panel_keys.append('output')
+    if has_output_proj:
+        all_panel_keys.append('output')
 
     if args.layers is not None:
         selected_keys = []
@@ -380,45 +490,57 @@ def main():
 
     sil_results = {}
 
-    def _make_single_umap(title, data, lb_key, save_path):
-        """Compute UMAP and save a single-layer figure."""
-        data, title = _maybe_pca(data, title)
-        print(f"Computing UMAP for {title}...")
-        reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
-                            metric='euclidean', n_jobs=-1)
-        embedding = reducer.fit_transform(data)
+    # ---- Phase 1: GPU k-NN precomputation for all panels ----
+    use_gpu_knn = torch.cuda.is_available()
+    precomputed = {}
+    if use_gpu_knn:
+        n_panels = len(panels)
+        print(f"\nComputing GPU k-NN for {n_panels} panels...")
+        t_knn = time.perf_counter()
+        for title, data, lb_key in panels:
+            data_pca, _ = _maybe_pca(data, title)
+            knn_dists, knn_indices = gpu_knn(
+                data_pca, k=args.umap_neighbors, batch_size=2048)
+            precomputed[lb_key] = (knn_indices, knn_dists)
+        print(f"  All k-NN done in {time.perf_counter() - t_knn:.2f}s")
 
-        sil = silhouette_score(embedding, states_sub)
-        sil_results[lb_key] = sil
-
-        fig, ax = plt.subplots(figsize=(10, 8))
-        sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
-                        cmap='tab10', s=4, alpha=0.5)
-        ax.set_xlabel('UMAP 1', fontsize=12)
-        ax.set_ylabel('UMAP 2', fontsize=12)
-
-        subtitle_parts = []
-        if lb_key in lb_results:
-            lb30 = lb_results[lb_key].get(30, None)
-            if lb30 is not None:
-                subtitle_parts.append(f'LB k=30: {lb30:.1f}')
-        subtitle_parts.append(f'Sil: {sil:.3f}')
-        title += f'  ({", ".join(subtitle_parts)})'
-        ax.set_title(title, fontsize=14)
-        ax.grid(True, alpha=0.2)
-        cbar = plt.colorbar(sc, ax=ax, label='Circle index')
-        cbar.set_ticks(range(config['n_circles']))
-
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Saved {save_path}")
-        return embedding
-
+    # ---- Phase 2: UMAP layout ----
     if args.per_layer:
         for title, data, lb_key in panels:
+            data, title = _maybe_pca(data, title)
+            t_start = time.perf_counter()
+            pre = precomputed.get(lb_key)
+            print(f"Fitting UMAP for {title}...")
+            embedding = _fit_umap(
+                (title, data, lb_key, args.umap_neighbors, pre))
+            print(f"  done in {time.perf_counter() - t_start:.2f}s")
+
+            sil = gpu_silhouette_score(embedding, states_sub)
+            sil_results[lb_key] = sil
+
+            fig, ax = plt.subplots(figsize=(10, 8))
+            sc = ax.scatter(embedding[:, 0], embedding[:, 1], c=states_sub,
+                            cmap='tab10', s=4, alpha=0.5)
+            ax.set_xlabel('UMAP 1', fontsize=12)
+            ax.set_ylabel('UMAP 2', fontsize=12)
+
+            subtitle_parts = []
+            if lb_key in lb_results:
+                lb30 = lb_results[lb_key].get(30, None)
+                if lb30 is not None:
+                    subtitle_parts.append(f'LB k=30: {lb30:.1f}')
+            subtitle_parts.append(f'Sil: {sil:.3f}')
+            title += f'  ({", ".join(subtitle_parts)})'
+            ax.set_title(title, fontsize=14)
+            ax.grid(True, alpha=0.2)
+            cbar = plt.colorbar(sc, ax=ax, label='Circle index')
+            cbar.set_ticks(range(config['n_circles']))
+
+            plt.tight_layout()
             fname = f'umap_{lb_key}.png'
-            _make_single_umap(title, data, lb_key, fname)
+            plt.savefig(fname, dpi=150, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved {fname}")
     else:
         n_panels = len(panels)
         n_cols = min(n_panels, 3)
@@ -432,12 +554,14 @@ def main():
 
         for ax_i, (title, data, lb_key) in enumerate(panels):
             data, title = _maybe_pca(data, title)
-            print(f"Computing UMAP for {title}...")
-            reducer = umap.UMAP(n_neighbors=args.umap_neighbors, min_dist=0.3,
-                                metric='euclidean', n_jobs=-1)
-            embedding = reducer.fit_transform(data)
+            t_start = time.perf_counter()
+            pre = precomputed.get(lb_key)
+            print(f"Fitting UMAP for {title}...")
+            embedding = _fit_umap(
+                (title, data, lb_key, args.umap_neighbors, pre))
+            print(f"  done in {time.perf_counter() - t_start:.2f}s")
 
-            sil = silhouette_score(embedding, states_sub)
+            sil = gpu_silhouette_score(embedding, states_sub)
             sil_results[lb_key] = sil
 
             ax = axes[ax_i]

@@ -36,7 +36,9 @@ class SyntheticSongDataset(Dataset):
         Length of each window (number of time steps).
     stride : int or None
         Step between consecutive windows.  Defaults to ``seq_len``
-        (non-overlapping).  Set to 1 for maximum overlap.
+        (non-overlapping).  When stride > 1 and mask_seed is None,
+        each access adds a random jitter in [0, stride) so every
+        epoch sees slightly different windows.
     mask_ratio : float
         Fraction of time steps to mask per window (0.0–1.0).
     mask_patch_size : int
@@ -88,9 +90,11 @@ class SyntheticSongDataset(Dataset):
         self.mask_patch_max = mask_patch_max if mask_patch_max is not None else mask_patch_size
         self.mask_seed = mask_seed
 
+        self._max_start = self.n_steps - self.seq_len
+
         # Pre-compute window start indices
         self.starts = list(range(
-            0, self.n_steps - self.seq_len + 1, self.stride
+            0, self._max_start + 1, self.stride
         ))
 
     def __len__(self):
@@ -140,6 +144,9 @@ class SyntheticSongDataset(Dataset):
 
     def __getitem__(self, idx):
         t0 = self.starts[idx]
+        if self.stride > 1 and self.mask_seed is None:
+            jitter = np.random.randint(0, self.stride)
+            t0 = min(t0 + jitter, self._max_start)
         t1 = t0 + self.seq_len
 
         x = torch.from_numpy(self.X[t0:t1].copy())

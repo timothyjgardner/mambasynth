@@ -255,14 +255,71 @@ The frozen model learns representations that are qualitatively comparable to the
 
 This suggests that for this task, Mamba's selectivity (input-dependent gating) is not critical. The random SSM provides a sufficiently rich bank of temporal mixing patterns -- 7 layers $\times$ 8,192 independent temporal modes = 57,344 random temporal features -- that the learned projections can select from. The model effectively learns to *route information through* fixed random temporal filters, consistent with the [random features](https://papers.nips.cc/paper/2007/hash/013a006f03dbc5392effeb8f18fda755-Abstract.html) framework (Rahimi & Recht, 2007).
 
+## Mamba-JEPA: Self-Supervised Representation Learning
+
+In addition to supervised next-step prediction, this repo includes a **JEPA** (Joint Embedding Predictive Architecture) variant that uses causal Mamba for self-supervised representation learning.
+
+### Architecture
+
+```
+Context encoder : Input → Linear(D_in→D) → Mamba (N layers) → LayerNorm → D-dim reps
+Target encoder  : Same architecture, EMA of context encoder (no gradients)
+Predictor       : context_rep[t] → MLP or small Mamba → predicted target_rep[t+1]
+Loss            : MSE(predictor(context_rep)[:-1], target_rep[1:])
+```
+
+Since Mamba is inherently causal, no masking is needed — the information asymmetry comes from causality itself. The target encoder is updated via exponential moving average (EMA) with a cosine momentum schedule from 0.996 → 1.0.
+
+### Predictor Choice Matters
+
+A key finding: the **predictor capacity** controls the quality of encoder representations. A weaker predictor forces the encoder to build richer, more discriminative representations since the predictor cannot compensate by modelling temporal dependencies itself.
+
+| Predictor | Val JEPA Loss | Peak Silhouette | Best Layer |
+|-----------|---------------|-----------------|------------|
+| 2-layer Mamba | 0.0191 | 0.381 | Layer 7 |
+| **Per-position MLP** | **0.0470** | **0.547** | **Layer 8 (norm)** |
+
+### Comparison: Next-Step (Observation) vs Mamba-JEPA (MLP Predictor)
+
+Both models trained on noisy Markov-switching data (stride 32, contrastive loss λ=1.0 for next-step model):
+
+| Layer | Next-Step (obs) 200ep | MLP JEPA 200ep | MLP JEPA 1000ep |
+|-------|-----------------------|----------------|-----------------|
+| Input | -0.069 | -0.068 | -0.069 |
+| Layer 1 | 0.220 | -0.047 | 0.199 |
+| Layer 2 | 0.282 | 0.129 | 0.361 |
+| Layer 3 | 0.362 | 0.211 | 0.432 |
+| Layer 4 | 0.386 | 0.318 | 0.423 |
+| Layer 5 | 0.404 | 0.381 | 0.438 |
+| Layer 6 | **0.435** | 0.377 | 0.407 |
+| Layer 7 | 0.424 | 0.386 | 0.370 |
+| Layer 8 (norm) | — | 0.453 | **0.547** |
+
+The Mamba-JEPA with MLP predictor at 1000 epochs achieves the best silhouette score (0.547), surpassing the supervised next-step prediction model (0.435) by a wide margin.
+
+### Training
+
+```bash
+# Mamba-JEPA with MLP predictor (recommended)
+python mamba_jepa.py --epochs 1000 --no-compile --predictor-mlp
+
+# Mamba-JEPA with Mamba predictor
+python mamba_jepa.py --epochs 200 --no-compile
+
+# Evaluate
+python evaluate_representations.py --checkpoint mamba_jepa_model.pt
+```
+
 ## Files
 
 | File | Description |
 |------|-------------|
-| `masked_model_gpu_mamba_next.py` | Main training script (causal Mamba model) |
+| `masked_model_gpu_mamba_next.py` | Supervised next-step prediction training script |
+| `mamba_jepa.py` | Self-supervised Mamba-JEPA training script |
 | `generate.py` | Autoregressive generation with perturbation support |
-| `evaluate_representations.py` | UMAP + Levina-Bickel evaluation |
+| `evaluate_representations.py` | UMAP + silhouette score + Levina-Bickel evaluation |
 | `visualize_gates.py` | Mamba gate visualisation (heatmaps + UMAP) |
+| `cluster_representations.py` | GPU spectral clustering of representations |
 | `dataset.py` | Sliding-window dataset loader |
 | `estimate_dimension.py` | Levina-Bickel intrinsic dimension estimator |
 | `markov_circles_timeseries.py` | Synthetic data generator |

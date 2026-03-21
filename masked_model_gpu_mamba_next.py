@@ -652,7 +652,7 @@ def main():
         stride=args.stride,
         mask_ratio=0.0,
         mask_patch_size=1,
-        mask_seed=0,
+        mask_seed=None,
     )
 
     n_val = max(1, int(len(full_ds) * args.val_fraction))
