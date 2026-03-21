@@ -29,6 +29,7 @@ from sklearn.decomposition import PCA
 
 from masked_model_gpu_mamba_next import CausalTimeSeriesMamba
 from mamba_jepa import CausalMambaJEPA
+from mamba_jepa_multiscale import CausalMambaJEPAMultiScale
 from estimate_dimension import levina_bickel_estimator
 
 
@@ -112,13 +113,36 @@ def _fit_umap(panel_args):
 
 
 def load_model(checkpoint_path, device):
-    """Load a trained model from checkpoint (supports both CausalTimeSeriesMamba
-    and CausalMambaJEPA)."""
+    """Load a trained model from checkpoint (supports CausalTimeSeriesMamba,
+    CausalMambaJEPA, and CausalMambaJEPAMultiScale)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     args = ckpt['args']
     model_type = args.get('model_type', 'mamba_next')
 
-    if model_type == 'mamba_jepa':
+    if model_type == 'mamba_jepa_multiscale':
+        branch_strides = args.get('branch_strides', [4])
+        layers_per_branch = args.get('layers_per_branch_parsed',
+                                     [args.get('n_layers', 7)] * len(branch_strides))
+        model = CausalMambaJEPAMultiScale(
+            feature_dim=args.get('feature_dim', 20),
+            d_model=args['d_model'],
+            strides=branch_strides,
+            layers_per_branch=layers_per_branch,
+            d_state=args['d_state'],
+            d_conv=args.get('d_conv', 4),
+            expand=args.get('expand', 2),
+            dropout=0.0,
+            kernel_factor=args.get('kernel_factor', 2),
+            predictor_n_layers=args.get('predictor_n_layers', 2),
+            predictor_type='mlp' if args.get('predictor_mlp', False) else 'mamba',
+        ).to(device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        model.eval()
+        val_metric = ckpt.get('val_loss', '?')
+        strides_str = ','.join(str(s) for s in branch_strides)
+        print(f"Loaded Multi-Scale Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
+              f"(val JEPA loss {val_metric:.4f}, strides=[{strides_str}])")
+    elif model_type == 'mamba_jepa':
         model = CausalMambaJEPA(
             feature_dim=args.get('feature_dim', 20),
             d_model=args['d_model'],
@@ -342,7 +366,7 @@ def main():
     states_used = states[:n_used]
 
     model_type = model_args.get('model_type', 'mamba_next')
-    has_output_proj = model_type != 'mamba_jepa'
+    has_output_proj = model_type not in ('mamba_jepa', 'mamba_jepa_multiscale')
 
     if has_output_proj:
         n_encoder_layers = len(layer_reps) - 1

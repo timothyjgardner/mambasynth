@@ -297,16 +297,72 @@ Both models trained on noisy Markov-switching data (stride 32, contrastive loss 
 
 The Mamba-JEPA with MLP predictor at 1000 epochs achieves the best silhouette score (0.547), surpassing the supervised next-step prediction model (0.435) by a wide margin.
 
+### Effect of Sequence Length
+
+Longer sequence windows give the encoder more temporal context per window:
+
+| seq_len | Val JEPA Loss | Peak Silhouette | Best Layer |
+|---------|---------------|-----------------|------------|
+| 128 | 0.0293 | 0.331 | Layer 7 |
+| **512** | **0.0420** | **0.547** | **Layer 8** |
+| 1024 | 0.0420 | 0.599 | Layer 8 |
+
+Longer windows help: `seq_len=1024` reaches **0.599** silhouette, the best result on the noisy random-walk dataset. The model benefits from seeing more of each circle's trajectory within a single window.
+
+## Multi-Scale Mamba-JEPA
+
+A variant with **convolutional temporal downsampling** before the Mamba layers. Each branch operates at a different temporal stride, forcing timescale separation architecturally rather than through the loss.
+
+### Architecture
+
+```
+Single branch (stride=4):
+  Input (B, T, D_in)
+    → CausalConv1d(kernel=8, stride=4) → (B, T/4, D)
+    → 7 Mamba layers (operating at 4× slower clock)
+    → LayerNorm → upsample → (B, T, D)
+
+Multi-branch (strides=[1, 4, 16]):
+  Input (B, T, D_in)
+    ├→ Branch 1: Linear         → 7 Mamba layers → (B, T, D)      [full speed]
+    ├→ Branch 2: Conv(stride=4) → 7 Mamba layers → upsample (B, T, D)  [4× slower]
+    └→ Branch 3: Conv(stride=16)→ 7 Mamba layers → upsample (B, T, D)  [16× slower]
+  Concatenate → Linear(3D→D) + LayerNorm → (B, T, D)
+```
+
+The stride-16 branch physically cannot represent anything faster than 16-step fluctuations — the conv has averaged it away. Its Mamba layers are forced to model slow structure (circle identity, orbital phase). The stride-1 branch preserves full temporal detail.
+
+### Results on High-Noise Data (noise_std=5.66, no random walk)
+
+Single branch (stride=4), MLP predictor, seq_len=512, stride=32:
+
+| Layer | 500 epochs | 1000 epochs |
+|-------|-----------|-------------|
+| Layer 3 | -0.092 | **0.503** |
+| Layer 4 | -0.003 | 0.497 |
+| Layer 8 | 0.359 | 0.507 |
+
+The model improves dramatically with longer training. At 1000 epochs, peak silhouette is **0.507** (Layer 8) with strong intermediate layers (Layer 3: 0.503).
+
 ### Training
 
 ```bash
-# Mamba-JEPA with MLP predictor (recommended)
+# Single slow branch (stride=4):
+python mamba_jepa_multiscale.py --strides 4 --predictor-mlp --epochs 1000 \
+    --no-compile --stride 32 --seq-len 512
+
+# Multi-scale branches (strides 1, 4, 16):
+python mamba_jepa_multiscale.py --strides 1,4,16 --predictor-mlp --epochs 1000 \
+    --no-compile --stride 32 --seq-len 512
+
+# Per-branch layer counts:
+python mamba_jepa_multiscale.py --strides 1,4,16 --layers-per-branch 3,5,7
+
+# Standard JEPA (MLP predictor, recommended):
 python mamba_jepa.py --epochs 1000 --no-compile --predictor-mlp
 
-# Mamba-JEPA with Mamba predictor
-python mamba_jepa.py --epochs 200 --no-compile
-
-# Evaluate
+# Evaluate any model:
+python evaluate_representations.py --checkpoint mamba_jepa_multiscale_model.pt
 python evaluate_representations.py --checkpoint mamba_jepa_model.pt
 ```
 
@@ -316,6 +372,7 @@ python evaluate_representations.py --checkpoint mamba_jepa_model.pt
 |------|-------------|
 | `masked_model_gpu_mamba_next.py` | Supervised next-step prediction training script |
 | `mamba_jepa.py` | Self-supervised Mamba-JEPA training script |
+| `mamba_jepa_multiscale.py` | Multi-scale Mamba-JEPA with convolutional timescale branches |
 | `generate.py` | Autoregressive generation with perturbation support |
 | `evaluate_representations.py` | UMAP + silhouette score + Levina-Bickel evaluation |
 | `visualize_gates.py` | Mamba gate visualisation (heatmaps + UMAP) |
