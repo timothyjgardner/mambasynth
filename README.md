@@ -4,7 +4,7 @@ Causal next-step prediction on synthetic time series using the [Mamba](https://a
 
 A Markov-switching process generates multi-dimensional time series from overlapping oscillatory circles. A Mamba model learns to predict the next time step autoregressively, building increasingly compressed representations of the underlying state space across its layers.
 
-![UMAP of per-layer representations colored by circle state](representation_umap_mamba.png)
+![UMAP of per-layer representations — best model (conv stride-4 JEPA, seq_len=1024)](representation_umap.png)
 
 ## Setup
 
@@ -304,14 +304,14 @@ Longer sequence windows give the encoder more temporal context per window:
 | seq_len | Val JEPA Loss | Peak Silhouette | Best Layer |
 |---------|---------------|-----------------|------------|
 | 128 | 0.0293 | 0.331 | Layer 7 |
-| **512** | **0.0420** | **0.547** | **Layer 8** |
-| 1024 | 0.0420 | 0.599 | Layer 8 |
+| 512 | 0.0420 | 0.547 | Layer 8 |
+| **1024** | **0.0420** | **0.599** | **Layer 8** |
 
-Longer windows help: `seq_len=1024` reaches **0.599** silhouette, the best result on the noisy random-walk dataset. The model benefits from seeing more of each circle's trajectory within a single window.
+Longer windows help: `seq_len=1024` reaches **0.599** silhouette on the noisy random-walk dataset. The model benefits from seeing more of each circle's trajectory within a single window.
 
 ## Multi-Scale Mamba-JEPA
 
-A variant with **convolutional temporal downsampling** before the Mamba layers. Each branch operates at a different temporal stride, forcing timescale separation architecturally rather than through the loss.
+A variant with **convolutional temporal downsampling** before the Mamba layers, integrated into `mamba_jepa.py` via the `--strides` flag. Each branch operates at a different temporal stride, forcing timescale separation architecturally rather than through the loss.
 
 ### Architecture
 
@@ -332,6 +332,23 @@ Multi-branch (strides=[1, 4, 16]):
 
 The stride-16 branch physically cannot represent anything faster than 16-step fluctuations — the conv has averaged it away. Its Mamba layers are forced to model slow structure (circle identity, orbital phase). The stride-1 branch preserves full temporal detail.
 
+### Best Result: Conv Stride-4 + seq_len=1024
+
+The convolutional front-end (stride=4) combined with long context windows achieves the **best overall silhouette score of 0.609**:
+
+| Layer | Silhouette |
+|-------|-----------|
+| Layer 1 | 0.396 |
+| Layer 2 | 0.564 |
+| Layer 3 | 0.549 |
+| Layer 4 | 0.593 |
+| **Layer 5** | **0.609** |
+| Layer 6 | 0.588 |
+| Layer 7 | 0.570 |
+| Layer 8 | 0.569 |
+
+Notably, silhouette scores are **broadly high across layers** (Layers 2-8 all above 0.54), unlike the standard JEPA which peaks sharply at one layer and drops off. The conv downsampling forces earlier compression and yields more uniformly useful representations.
+
 ### Results on High-Noise Data (noise_std=5.66, no random walk)
 
 Single branch (stride=4), MLP predictor, seq_len=512, stride=32:
@@ -342,37 +359,51 @@ Single branch (stride=4), MLP predictor, seq_len=512, stride=32:
 | Layer 4 | -0.003 | 0.497 |
 | Layer 8 | 0.359 | 0.507 |
 
-The model improves dramatically with longer training. At 1000 epochs, peak silhouette is **0.507** (Layer 8) with strong intermediate layers (Layer 3: 0.503).
+### Multi-Branch Caveat
+
+Multi-branch configurations (e.g., strides=[1,4,16]) suffer from a **lazy branch problem**: the stride-1 branch dominates with single-step prediction loss, making slower branches redundant. The fusion layer learns to prioritize the fast branch. Single-branch configurations with moderate stride (4) work best.
 
 ### Training
 
+All variants run through the unified `mamba_jepa.py`:
+
 ```bash
-# Single slow branch (stride=4):
-python mamba_jepa_multiscale.py --strides 4 --predictor-mlp --epochs 1000 \
-    --no-compile --stride 32 --seq-len 512
+# Best configuration (conv stride-4, long context):
+python mamba_jepa.py --strides 4 --predictor-mlp --epochs 1000 \
+    --no-compile --stride 32 --seq-len 1024
 
-# Multi-scale branches (strides 1, 4, 16):
-python mamba_jepa_multiscale.py --strides 1,4,16 --predictor-mlp --epochs 1000 \
-    --no-compile --stride 32 --seq-len 512
+# Standard JEPA (no conv head):
+python mamba_jepa.py --predictor-mlp --epochs 1000 --no-compile --seq-len 1024
 
-# Per-branch layer counts:
-python mamba_jepa_multiscale.py --strides 1,4,16 --layers-per-branch 3,5,7
+# Multi-scale branches:
+python mamba_jepa.py --strides 1,4,16 --predictor-mlp --epochs 1000 --no-compile
 
-# Standard JEPA (MLP predictor, recommended):
-python mamba_jepa.py --epochs 1000 --no-compile --predictor-mlp
+# Deep supervision (per-layer loss):
+python mamba_jepa.py --per-layer-loss --predictor-mlp --epochs 1000 --no-compile
 
 # Evaluate any model:
-python evaluate_representations.py --checkpoint mamba_jepa_multiscale_model.pt
 python evaluate_representations.py --checkpoint mamba_jepa_model.pt
 ```
+
+## Summary of Best Results
+
+| Model | Data | Epochs | seq_len | Peak Silhouette |
+|-------|------|--------|---------|-----------------|
+| **Conv stride-4 JEPA** | **noisy + random walk** | **1000** | **1024** | **0.609** |
+| Standard JEPA | noisy + random walk | 1000 | 1024 | 0.599 |
+| Standard JEPA | noisy + random walk | 1000 | 512 | 0.547 |
+| Conv stride-4 JEPA | 2× noise, no walk | 1000 | 512 | 0.515 |
+| Supervised next-step | noisy + random walk | 200 | 1024 | 0.435 |
+
+All JEPA models use the MLP predictor. See [RESEARCH_LOG.md](RESEARCH_LOG.md) for full experiment history.
 
 ## Files
 
 | File | Description |
 |------|-------------|
+| `mamba_jepa.py` | Unified Mamba-JEPA: standard, multi-scale (`--strides`), deep supervision (`--per-layer-loss`) |
 | `masked_model_gpu_mamba_next.py` | Supervised next-step prediction training script |
-| `mamba_jepa.py` | Self-supervised Mamba-JEPA training script |
-| `mamba_jepa_multiscale.py` | Multi-scale Mamba-JEPA with convolutional timescale branches |
+| `mamba_jepa_multiscale.py` | Legacy multi-scale script (superseded by unified `mamba_jepa.py`) |
 | `generate.py` | Autoregressive generation with perturbation support |
 | `evaluate_representations.py` | UMAP + silhouette score + Levina-Bickel evaluation |
 | `visualize_gates.py` | Mamba gate visualisation (heatmaps + UMAP) |
@@ -380,3 +411,4 @@ python evaluate_representations.py --checkpoint mamba_jepa_model.pt
 | `dataset.py` | Sliding-window dataset loader |
 | `estimate_dimension.py` | Levina-Bickel intrinsic dimension estimator |
 | `markov_circles_timeseries.py` | Synthetic data generator |
+| `RESEARCH_LOG.md` | Full experiment history and architectural decisions |

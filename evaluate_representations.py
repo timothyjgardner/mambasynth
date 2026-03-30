@@ -29,7 +29,6 @@ from sklearn.decomposition import PCA
 
 from masked_model_gpu_mamba_next import CausalTimeSeriesMamba
 from mamba_jepa import CausalMambaJEPA
-from mamba_jepa_multiscale import CausalMambaJEPAMultiScale
 from estimate_dimension import levina_bickel_estimator
 
 
@@ -113,52 +112,56 @@ def _fit_umap(panel_args):
 
 
 def load_model(checkpoint_path, device):
-    """Load a trained model from checkpoint (supports CausalTimeSeriesMamba,
-    CausalMambaJEPA, and CausalMambaJEPAMultiScale)."""
+    """Load a trained model from checkpoint (supports CausalTimeSeriesMamba
+    and CausalMambaJEPA — including multi-scale variants)."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     args = ckpt['args']
     model_type = args.get('model_type', 'mamba_next')
 
-    if model_type == 'mamba_jepa_multiscale':
-        branch_strides = args.get('branch_strides', [4])
-        layers_per_branch = args.get('layers_per_branch_parsed',
-                                     [args.get('n_layers', 7)] * len(branch_strides))
-        model = CausalMambaJEPAMultiScale(
-            feature_dim=args.get('feature_dim', 20),
-            d_model=args['d_model'],
-            strides=branch_strides,
-            layers_per_branch=layers_per_branch,
-            d_state=args['d_state'],
-            d_conv=args.get('d_conv', 4),
-            expand=args.get('expand', 2),
-            dropout=0.0,
-            kernel_factor=args.get('kernel_factor', 2),
-            predictor_n_layers=args.get('predictor_n_layers', 2),
-            predictor_type='mlp' if args.get('predictor_mlp', False) else 'mamba',
-        ).to(device)
-        model.load_state_dict(ckpt['model_state_dict'])
-        model.eval()
-        val_metric = ckpt.get('val_loss', '?')
-        strides_str = ','.join(str(s) for s in branch_strides)
-        print(f"Loaded Multi-Scale Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
-              f"(val JEPA loss {val_metric:.4f}, strides=[{strides_str}])")
-    elif model_type == 'mamba_jepa':
+    if model_type in ('mamba_jepa', 'mamba_jepa_multiscale'):
+        # Determine multi-scale params (backward compat with old multiscale ckpts)
+        branch_strides = args.get('branch_strides', None)
+        if model_type == 'mamba_jepa_multiscale' and branch_strides is None:
+            branch_strides = [4]
+
+        if branch_strides is not None:
+            layers_per_branch = args.get(
+                'layers_per_branch_parsed',
+                [args.get('n_layers', 7)] * len(branch_strides))
+        else:
+            layers_per_branch = None
+
         model = CausalMambaJEPA(
             feature_dim=args.get('feature_dim', 20),
             d_model=args['d_model'],
-            n_layers=args['n_layers'],
+            n_layers=args.get('n_layers', 7),
             d_state=args['d_state'],
             d_conv=args.get('d_conv', 4),
             expand=args.get('expand', 2),
+            per_layer_loss=args.get('per_layer_loss', False),
             dropout=0.0,
             predictor_n_layers=args.get('predictor_n_layers', 2),
             predictor_type='mlp' if args.get('predictor_mlp', False) else 'mamba',
+            strides=branch_strides,
+            layers_per_branch=layers_per_branch,
+            kernel_factor=args.get('kernel_factor', 2),
         ).to(device)
-        model.load_state_dict(ckpt['model_state_dict'])
+
+        # Old multiscale ckpts may lack layer_norms in ConvBranch
+        try:
+            model.load_state_dict(ckpt['model_state_dict'])
+        except RuntimeError:
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
         model.eval()
+
         val_metric = ckpt.get('val_loss', '?')
-        print(f"Loaded Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
-              f"(val JEPA loss {val_metric:.4f})")
+        if branch_strides is not None:
+            strides_str = ','.join(str(s) for s in branch_strides)
+            print(f"Loaded Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
+                  f"(val JEPA loss {val_metric:.4f}, strides=[{strides_str}])")
+        else:
+            print(f"Loaded Mamba-JEPA checkpoint from epoch {ckpt['epoch']}  "
+                  f"(val JEPA loss {val_metric:.4f})")
     else:
         model = CausalTimeSeriesMamba(
             feature_dim=args.get('feature_dim', 20),
