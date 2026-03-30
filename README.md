@@ -6,6 +6,12 @@ A Markov-switching process generates multi-dimensional time series from overlapp
 
 ![UMAP of per-layer representations — best model (conv stride-4 JEPA, seq_len=1024)](representation_umap.png)
 
+The figure above shows UMAP projections of each Mamba layer's internal representations, colored by the true Markov state (circle index). The input is a noisy 20D mixture of 10 overlapping oscillatory circles with random-walk drift on the centers. By Layer 5, the model has learned to separate all 10 circles into distinct clusters (silhouette score 0.609), despite never receiving state labels during training. This is the output of:
+
+```bash
+python mamba_jepa.py --strides 4 --predictor-mlp --epochs 1000 --no-compile --stride 32 --seq-len 1024
+```
+
 ## Setup
 
 ```bash
