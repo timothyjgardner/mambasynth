@@ -391,6 +391,44 @@ python mamba_jepa.py --per-layer-loss --predictor-mlp --epochs 1000 --no-compile
 python evaluate_representations.py --checkpoint mamba_jepa_model.pt
 ```
 
+## Homeostatic Pre-Activation Regularization
+
+Extended training (e.g. 3000 epochs) causes representation **overspecialization**: the UMAP clusters collapse into stringy, tangled manifolds and silhouette scores degrade sharply (0.609 → 0.449 at Layer 2). The model overfits its temporal prediction objective at the expense of representational structure.
+
+To combat this, we implement a **homeostatic pre-activation penalty** adapted from continual learning research. The idea is to add an L2 penalty on the hidden states at each layer boundary (before LayerNorm), driving the network toward a low-magnitude resting state:
+
+```
+L_total = L_JEPA + λ * L_homeo
+
+L_homeo = (1/L) Σ_l mean(h_l²)
+```
+
+where `h_l` is the hidden state after the `l`-th Mamba layer (before LayerNorm), and `L` is the number of layers.
+
+### Why pre-activation (not weights or post-norm)?
+
+- **Weight decay** shrinks weights globally without regard to activation magnitudes.
+- **Post-norm penalties** miss the information about how far the raw activations drift.
+- **Pre-activation penalties** directly constrain the residual stream magnitude, preventing the hidden states from drifting to extreme values over long training. The gradient is bidirectional: strongly positive activations are pushed down, strongly negative ones are pushed up, and near-zero activations receive minimal gradient.
+
+### Usage
+
+```bash
+# Enable with --preact-lambda (default 0 = disabled)
+python mamba_jepa.py --strides 4 --predictor-mlp --epochs 1000 \
+    --no-compile --stride 32 --seq-len 1024 --preact-lambda 0.001
+```
+
+The homeostatic loss is logged in a separate column during training. Start with small values (1e-4 to 1e-3) — the penalty should gently regularize without dominating the JEPA loss.
+
+### Implementation
+
+The penalty is computed at each encoder layer boundary:
+- `MambaEncoder`: caches hidden states after each Mamba layer
+- `ConvBranch`: same caching in the convolutional branch path
+- `MultiScaleEncoder`: averages homeostatic loss across all branches
+- `CausalMambaJEPA.homeostatic_loss()`: delegates to the context encoder (target encoder has no gradients)
+
 ## Summary of Best Results
 
 | Model | Data | Epochs | seq_len | Peak Silhouette |

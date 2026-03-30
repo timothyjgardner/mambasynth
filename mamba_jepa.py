@@ -92,17 +92,29 @@ class MambaEncoder(nn.Module):
         outputs (including final norm) instead of just the final output.
         """
         h = self.input_dropout(self.input_proj(x))
+        self._cached_hiddens = []
         if not return_all_layers:
             for layer in self.layers:
                 h = layer(h)
+                self._cached_hiddens.append(h)
             return self.final_norm(h)
 
         outputs = []
         for layer, norm in zip(self.layers, self.layer_norms):
             h = layer(h)
+            self._cached_hiddens.append(h)
             outputs.append(norm(h))
         outputs.append(self.final_norm(h))
         return outputs
+
+    def homeostatic_loss(self):
+        """L2 penalty on pre-norm hidden states at each layer boundary."""
+        if not self._cached_hiddens:
+            return torch.tensor(0.0)
+        total = 0.0
+        for h in self._cached_hiddens:
+            total = total + h.pow(2).mean()
+        return total / len(self._cached_hiddens)
 
     @torch.no_grad()
     def forward_layers(self, x):
@@ -184,17 +196,29 @@ class ConvBranch(nn.Module):
             h = self.conv(h)
             h = h.transpose(1, 2)
 
+        self._cached_hiddens = []
         if not return_all_layers:
             for layer in self.layers:
                 h = layer(h)
+                self._cached_hiddens.append(h)
             return self._upsample(self.norm(h), T_orig)
 
         outputs = []
         for layer, ln in zip(self.layers, self.layer_norms):
             h = layer(h)
+            self._cached_hiddens.append(h)
             outputs.append(self._upsample(ln(h), T_orig))
         outputs.append(self._upsample(self.norm(h), T_orig))
         return outputs
+
+    def homeostatic_loss(self):
+        """L2 penalty on pre-norm hidden states at each layer boundary."""
+        if not self._cached_hiddens:
+            return torch.tensor(0.0)
+        total = 0.0
+        for h in self._cached_hiddens:
+            total = total + h.pow(2).mean()
+        return total / len(self._cached_hiddens)
 
     @torch.no_grad()
     def forward_layers(self, x):
@@ -273,6 +297,13 @@ class MultiScaleEncoder(nn.Module):
             fused = self.fusion(torch.cat(parts, dim=-1))
             outputs.append(fused)
         return outputs
+
+    def homeostatic_loss(self):
+        """Aggregate homeostatic loss from all branches."""
+        total = 0.0
+        for branch in self.branches:
+            total = total + branch.homeostatic_loss()
+        return total / len(self.branches)
 
     @torch.no_grad()
     def forward_layers(self, x):
@@ -487,6 +518,10 @@ class CausalMambaJEPA(nn.Module):
 
         return per_layer_preds, per_layer_targets
 
+    def homeostatic_loss(self):
+        """L2 penalty on context encoder's pre-norm hidden states."""
+        return self.context_encoder.homeostatic_loss()
+
     @torch.no_grad()
     def update_target_encoder(self, momentum):
         """EMA update: θ_target = τ · θ_target + (1 − τ) · θ_context"""
@@ -539,9 +574,10 @@ def momentum_schedule(epoch, n_epochs, base_momentum=0.996):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
-                    momentum):
+                    momentum, preact_lambda=0.0):
     model.train()
     total_loss = 0.0
+    total_homeo = 0.0
     n_batches = 0
 
     for x, _state, _mask in loader:
@@ -551,6 +587,12 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
             pred_reps, target_reps = model(x)
             result = jepa_loss(pred_reps, target_reps)
             loss = result[0] if isinstance(result, tuple) else result
+
+            if preact_lambda > 0:
+                raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+                homeo = raw.homeostatic_loss()
+                loss = loss + preact_lambda * homeo
+                total_homeo += homeo.item()
 
         optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
@@ -566,7 +608,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, amp_dtype,
         total_loss += loss.item()
         n_batches += 1
 
-    return total_loss / max(n_batches, 1)
+    n = max(n_batches, 1)
+    if preact_lambda > 0:
+        return total_loss / n, total_homeo / n
+    return total_loss / n
 
 
 @torch.no_grad()
@@ -715,6 +760,11 @@ def main():
                              'Defaults to --n-layers for each branch.')
     parser.add_argument('--kernel-factor', type=int, default=2,
                         help='Conv kernel = kernel_factor × stride')
+    # Regularization
+    parser.add_argument('--preact-lambda', type=float, default=0.0,
+                        help='Homeostatic pre-activation L2 penalty strength '
+                             '(0 = disabled).  Penalizes hidden state magnitudes '
+                             'at each layer boundary to prevent overspecialization.')
     # EMA
     parser.add_argument('--ema-base', type=float, default=0.996,
                         help='Base EMA momentum (annealed to 1.0 via cosine)')
@@ -860,6 +910,8 @@ def main():
     print(f"  d_model={args.d_model}, d_state={args.d_state}, "
           f"d_conv={args.d_conv}, expand={args.expand}")
     print(f"  EMA base momentum: {args.ema_base}")
+    if args.preact_lambda > 0:
+        print(f"  Homeostatic pre-activation penalty: λ={args.preact_lambda}")
 
     # ---- torch.compile ----
     if not args.no_compile and device.type == 'cuda':
@@ -925,15 +977,24 @@ def main():
               f"{'TgtStd':<8} {'LR':<12} {'Mom':<8} {'Time':<8} {'Best'}")
     if args.per_layer_loss:
         header += "  Per-layer val losses"
+    if args.preact_lambda > 0:
+        header += "  Homeo"
     print(f"\n{header}")
-    print('-' * (90 + (30 if args.per_layer_loss else 0)))
+    print('-' * (90 + (30 if args.per_layer_loss else 0)
+                 + (8 if args.preact_lambda > 0 else 0)))
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.perf_counter()
 
         mom = momentum_schedule(epoch, args.epochs, args.ema_base)
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, amp_dtype, mom)
+        train_result = train_one_epoch(
+            model, train_loader, optimizer, scaler, device, amp_dtype, mom,
+            preact_lambda=args.preact_lambda)
+        if isinstance(train_result, tuple):
+            train_loss, homeo_loss = train_result
+        else:
+            train_loss, homeo_loss = train_result, None
+
         eval_result = evaluate(model, val_loader, device, amp_dtype)
         val_loss, cos_sim, tgt_std = eval_result[:3]
         per_layer_val = eval_result[3] if len(eval_result) > 3 else None
@@ -983,6 +1044,8 @@ def main():
             if per_layer_val is not None:
                 layer_str = '  [' + ', '.join(f'{v:.4f}' for v in per_layer_val) + ']'
                 line += layer_str
+            if homeo_loss is not None:
+                line += f'  {homeo_loss:.4f}'
             print(line)
 
         if epoch % plot_every == 0 or epoch == args.epochs:
